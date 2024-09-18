@@ -1,0 +1,8 @@
+torch
+torchaudio
+transformers
+soundfile
+joblib
+tqdm
+h5py
+pandas

@@ -1,0 +1,26 @@
+# Ignore audio files
+data/raw/test_songs/
+data/raw/**/*.mp3
+data/raw/**/*.wav
+data/raw/**/*.flac
+
+# Ignore embeddings (if not needed in the repo)
+data/embeddings/
+
+# Ignore any other data files
+data/*.tar.gz
+data/*.zip
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore virtual environment directories
+env/
+venv/
+
+# Ignore system files
+.DS_Store
