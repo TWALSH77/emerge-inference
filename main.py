@@ -28,6 +28,7 @@ def parse_arguments():
     parser.add_argument('--segment_length', type=int, default=10, help='Length of each audio segment in seconds')
     parser.add_argument('--overlap', type=int, default=1, help='Overlap between segments in seconds')
     parser.add_argument('--device', type=str, default=None, help='Device to use: cuda, mps, cpu')
+    parser.add_argument('--max_segments', type=int, default=None, help='Maximum number of segments to process (for testing)')
     return parser.parse_args()
 
 def main():
@@ -38,11 +39,16 @@ def main():
     segment_length = args.segment_length
     overlap = args.overlap
     specified_device = args.device
+    max_segments = args.max_segments
 
     logger.info(f"Batch size: {batch_size}")
     logger.info(f"Number of workers: {num_workers}")
     logger.info(f"Segment length: {segment_length} seconds")
     logger.info(f"Overlap: {overlap} seconds")
+    if max_segments:
+        logger.info(f"Max segments: {max_segments}")
+    else:
+        logger.info("Max segments: None (processing all segments)")
 
     # Create necessary directories
     current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -76,6 +82,7 @@ def main():
     model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
     model.eval()
     model.to(device)
+    logger.info("Model loaded and moved to device.")
 
     processor = AutoFeatureExtractor.from_pretrained(model_name, trust_remote_code=True)
     resample_rate = processor.sampling_rate
@@ -105,6 +112,7 @@ def main():
             sample_rate=resample_rate,
             segment_length=segment_length,
             overlap=overlap,
+            max_segments=max_segments,  # Optional: Limit segments for testing
         )
         logger.info(f"Dataset length: {len(ds)} segments")
 
@@ -128,7 +136,10 @@ def main():
         embedding_dir = os.path.join(embedding_root, os.path.splitext(csv_file_name)[0])
         os.makedirs(embedding_dir, exist_ok=True)
 
-        # Disable gradient calculations for inference
+        # Start inference
+        logger.info("Starting inference...")
+        inference_start_time = time.time()
+
         with torch.inference_mode():
             for idx, input_audio in tqdm(enumerate(data_loader), total=len(data_loader), desc="Inference"):
                 if not input_audio:
@@ -171,7 +182,9 @@ def main():
                     with h5py.File(embedding_file, 'w') as hf:
                         hf.create_dataset(str(unique_id.item()), data=time_reduced_hidden_states_ind.cpu().numpy())
 
-        logger.info("Processing complete for CSV file: {}".format(csv_file_name))
+        inference_end_time = time.time()
+        logger.info(f"Inference completed in {inference_end_time - inference_start_time:.2f} seconds.")
+        logger.info(f"Processing complete for CSV file: {csv_file_name}")
 
     logger.info("All CSV files have been processed.")
 
