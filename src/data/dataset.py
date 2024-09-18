@@ -39,15 +39,10 @@ class GenericAudioDataset(Dataset):
         def check_file_exists(x):
             audio_path = os.path.join(self.root_dir, self.csv_file_name, x)
             exists = os.path.exists(audio_path)
-            print(f"Checking if file exists: {audio_path} -> {exists}")
             return exists
 
         self.audio_metadata['file_exists'] = self.audio_metadata['filename'].apply(check_file_exists)
         self.audio_metadata = self.audio_metadata[self.audio_metadata['file_exists']]
-
-        print(f"Number of audio files found after filtering: {len(self.audio_metadata)}")
-        print(f"Root directory: {self.root_dir}")
-        print(f"CSV file name: {self.csv_file_name}")
 
         # Generate segments
         self.segments = []
@@ -60,9 +55,7 @@ class GenericAudioDataset(Dataset):
                     resampler = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=self.sample_rate)
                     waveform = resampler(waveform)
                 audio_length = waveform.shape[1] / self.sample_rate
-                print(f"Audio length for file {audio_path}: {audio_length} seconds")
                 num_segments = int((audio_length - self.segment_length) // (self.segment_length - self.overlap) + 1)
-                print(f"Number of segments for file {audio_path}: {num_segments}")
                 if num_segments > 0:
                     for i in range(num_segments):
                         start = int((self.segment_length - self.overlap) * i * self.sample_rate)
@@ -73,10 +66,8 @@ class GenericAudioDataset(Dataset):
                             'start': start,
                             'end': end,
                         })
-                else:
-                    print(f"No segments generated for file {audio_path}")
             except Exception as e:
-                print(f"Error loading audio file {audio_path}: {e}")
+                logger.error(f"Error loading audio file {audio_path}: {e}")
                 continue
 
     def __len__(self):
@@ -98,17 +89,13 @@ class GenericAudioDataset(Dataset):
             data = {'id': segment['id'], 'audio': waveform}
             return data
         except Exception as e:
-            print(f"Error loading audio segment {audio_path}: {e}")
+            logger.error(f"Error loading audio segment {audio_path}: {e}")
             return None
 
 def audio_collate_fn_segments(batch, processor):
     batch = [b for b in batch if b is not None]
     ids = [item['id'] for item in batch]
     audios = [item['audio'].squeeze().numpy() for item in batch]
-    # Debugging: print audio shapes
-    print(f"Audio shapes: {[audio.shape for audio in audios]}")
     inputs = processor(audios, sampling_rate=processor.sampling_rate, padding=True, return_tensors="pt")
-    # Debugging: print input shapes
-    print(f"Input values shape after processor: {inputs['input_values'].shape}")
     inputs['id'] = ids
     return inputs
