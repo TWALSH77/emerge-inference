@@ -1,5 +1,8 @@
 import sys
 import os
+import csv
+import requests
+import tempfile
 
 # Add src folder to the path
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -10,8 +13,56 @@ import glob
 import h5py
 from tqdm import tqdm
 from transformers import AutoFeatureExtractor, AutoModel
-from src.data.dataset import GenericAudioDataset, audio_collate_fn_segments
 import torch
+from pydub import AudioSegment
+import librosa
+
+class CustomAudioDataset(torch.utils.data.Dataset):
+    def __init__(self, audio_path, sample_rate, segment_length):
+        self.audio_path = audio_path
+        self.sample_rate = sample_rate
+        self.segment_length = segment_length
+        self.audio, _ = librosa.load(self.audio_path, sr=self.sample_rate)
+        
+    def __len__(self):
+        return max(1, len(self.audio) // (self.sample_rate * self.segment_length))
+    
+    def __getitem__(self, idx):
+        start = idx * self.sample_rate * self.segment_length
+        end = start + self.sample_rate * self.segment_length
+        audio_segment = self.audio[start:end]
+        
+        if len(audio_segment) < self.sample_rate * self.segment_length:
+            audio_segment = librosa.util.fix_length(audio_segment, size=self.sample_rate * self.segment_length)
+        
+        return {'input_values': audio_segment, 'id': idx}
+
+def custom_collate_fn(batch, processor):
+    input_values = [item['input_values'] for item in batch]
+    processed = processor(input_values, sampling_rate=processor.sampling_rate, return_tensors="pt", padding=True)
+    ids = [item['id'] for item in batch]
+    return {'input_values': processed.input_values, 'attention_mask': processed.attention_mask, 'id': ids}
+
+def download_m4a(url):
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.content
+    else:
+        raise Exception(f"Failed to download file from {url}")
+
+def convert_m4a_to_wav(m4a_data):
+    with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as temp_m4a:
+        temp_m4a.write(m4a_data)
+        temp_m4a_path = temp_m4a.name
+
+    audio = AudioSegment.from_file(temp_m4a_path, format="m4a")
+    
+    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
+        audio.export(temp_wav.name, format="wav")
+        temp_wav_path = temp_wav.name
+
+    os.unlink(temp_m4a_path)
+    return temp_wav_path
 
 def main():
     # Create necessary directories
@@ -53,70 +104,72 @@ def main():
     print(f"Embedding root directory: {embedding_root}")
 
     # Process CSV files
-    csv_files = glob.glob(os.path.join(csv_root, "*.csv"))
-    print(f"Found CSV files: {csv_files}")
+    csv_files = glob.glob(os.path.join(csv_root, "chunk_*.csv"))
+    print(f"Found CSV files")
     for csv_file in csv_files:
         csv_file_name = os.path.basename(csv_file)
-        songs_root_path = os.path.join(save_dir, os.path.splitext(csv_file_name)[0])
-
         print(f"\nProcessing CSV file: {csv_file}")
 
-        ds = GenericAudioDataset(
-            csv_file=csv_file,
-            root_path=save_dir,
-            sample_rate=resample_rate,
-            segment_length=10,
-            overlap=1,
-        )
-        print(f"Dataset length: {len(ds)}")
+        # Read CSV and process each row
+        with open(csv_file, 'r') as file:
+            csv_reader = csv.DictReader(file)
+            for row in tqdm(csv_reader, desc="Processing tracks"):
+                preview_url = row['previewUrl']
+                track_id = row.get('id', 'unknown')  # Assuming there's an 'id' column, otherwise use 'unknown'
 
-        if len(ds) == 0:
-            print("Dataset is empty. Please check if the audio files exist at the specified paths.")
-            continue  # Skip to the next CSV file if dataset is empty
+                try:
+                    # Download and convert m4a to wav
+                    m4a_data = download_m4a(preview_url)
+                    temp_wav_path = convert_m4a_to_wav(m4a_data)
 
-        my_collate_fn = partial(audio_collate_fn_segments, processor=processor)
-        data_loader = torch.utils.data.DataLoader(
-            ds,
-            batch_size=1,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-            collate_fn=my_collate_fn,
-        )
+                    # Create a temporary dataset with this single file
+                    temp_dataset = CustomAudioDataset(
+                        audio_path=temp_wav_path,
+                        sample_rate=resample_rate,
+                        segment_length=10
+                    )
 
-        with torch.inference_mode():
-            for idx, input_audio in tqdm(enumerate(data_loader), total=len(data_loader), desc="Inference"):
-                ids = [int(x) for x in input_audio['id']]
-                inputs = {
-                    'input_values': input_audio['input_values'].to(device),
-                    'attention_mask': input_audio.get('attention_mask', None)
-                }
-                if inputs['attention_mask'] is not None:
-                    inputs['attention_mask'] = inputs['attention_mask'].to(device)
+                    my_collate_fn = partial(custom_collate_fn, processor=processor)
+                    data_loader = torch.utils.data.DataLoader(
+                        temp_dataset,
+                        batch_size=1,
+                        shuffle=False,
+                        num_workers=0,
+                        pin_memory=False,
+                        collate_fn=my_collate_fn,
+                    )
 
-                # Debugging: print input shapes
-                print(f"Input values shape: {inputs['input_values'].shape}")
-                if inputs['attention_mask'] is not None:
-                    print(f"Attention mask shape: {inputs['attention_mask'].shape}")
+                    with torch.inference_mode():
+                        for input_audio in data_loader:
+                            inputs = {
+                                'input_values': input_audio['input_values'].to(device),
+                                'attention_mask': input_audio.get('attention_mask', None)
+                            }
+                            if inputs['attention_mask'] is not None:
+                                inputs['attention_mask'] = inputs['attention_mask'].to(device)
 
-                outputs = model(**inputs, output_hidden_states=True)
+                            outputs = model(**inputs, output_hidden_states=True)
 
-                # Process outputs
-                all_layer_hidden_states = torch.stack(outputs.hidden_states).permute(1, 0, 2, 3)
-                time_reduced_hidden_states = all_layer_hidden_states.mean(-2)
+                            # Process outputs
+                            all_layer_hidden_states = torch.stack(outputs.hidden_states).permute(1, 0, 2, 3)
+                            time_reduced_hidden_states = all_layer_hidden_states.mean(-2)
 
-                for id in torch.unique(torch.tensor(ids)):
-                    indices = torch.where(torch.tensor(ids) == id)[0]
-                    time_reduced_hidden_states_ind = time_reduced_hidden_states[indices].mean(0, keepdim=True)
+                            # Save embeddings
+                            embedding_dir = os.path.join(embedding_root, os.path.splitext(csv_file_name)[0])
+                            os.makedirs(embedding_dir, exist_ok=True)
+                            embedding_file = os.path.join(embedding_dir, f"audio_embeddings_{safe_model_name}_{track_id}.h5")
+                            with h5py.File(embedding_file, 'w') as hf:
+                                hf.create_dataset(str(track_id), data=time_reduced_hidden_states.cpu().numpy())
 
-                    # Save embeddings
-                    embedding_dir = os.path.join(embedding_root, os.path.splitext(csv_file_name)[0])
-                    os.makedirs(embedding_dir, exist_ok=True)
-                    embedding_file = os.path.join(embedding_dir, f"audio_embeddings_{safe_model_name}_{id.item()}.h5")
-                    with h5py.File(embedding_file, 'w') as hf:
-                        hf.create_dataset(str(id.item()), data=time_reduced_hidden_states_ind.cpu().numpy())
+                    # Clean up temporary file
+                    os.unlink(temp_wav_path)
 
-        print("Processing complete.")
+                except Exception as e:
+                    print(f"Error processing track ID {track_id}: {str(e)}")
+
+        print(f"Completed processing CSV file: {csv_file}")
+
+    print("All processing complete.")
 
 if __name__ == "__main__":
     main()
