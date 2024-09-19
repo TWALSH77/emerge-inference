@@ -25,6 +25,19 @@ def setup_logging():
         ]
     )
 
+def read_csv_file(csv_path):
+    try:
+        # Attempt to read the CSV, skipping bad lines and logging them
+        df = pd.read_csv(csv_path, on_bad_lines='warn')  # For pandas >= 1.3.0
+        logging.info(f"Successfully read CSV file: {csv_path}")
+        return df
+    except pd.errors.ParserError as e:
+        logging.error(f"ParserError while reading CSV file: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Unexpected error while reading CSV file: {e}")
+        sys.exit(1)
+
 def main():
     setup_logging()
     logger = logging.getLogger("Main")
@@ -46,14 +59,13 @@ def main():
     os.makedirs(wav_dir, exist_ok=True)
     os.makedirs(embedding_root, exist_ok=True)
 
-    # Read CSV file
+    # Read CSV file with enhanced error handling
     csv_file = args.csv
     if not os.path.exists(csv_file):
         logger.error(f"CSV file does not exist: {csv_file}")
         sys.exit(1)
 
-    # Read the CSV to get download tasks
-    df = pd.read_csv(csv_file)
+    df = read_csv_file(csv_file)
     download_tasks = []
     for _, row in df.iterrows():
         song_id = row['id']
@@ -79,7 +91,7 @@ def main():
     num_downloader_threads = args.download_workers
     downloader_threads = []
     for _ in range(num_downloader_threads):
-        t = Thread(target=downloader_worker, args=(download_queue, convert_queue, download_dir))
+        t = Thread(target=downloader_worker, args=(download_queue, convert_queue, download_dir, args.download_workers))
         t.start()
         downloader_threads.append(t)
 
@@ -87,7 +99,7 @@ def main():
     num_converter_threads = args.convert_workers
     converter_threads = []
     for _ in range(num_converter_threads):
-        t = Thread(target=converter_worker, args=(convert_queue, embed_queue, wav_dir))
+        t = Thread(target=converter_worker, args=(convert_queue, embed_queue, wav_dir, args.convert_workers))
         t.start()
         converter_threads.append(t)
 
