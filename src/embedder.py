@@ -8,11 +8,13 @@ import logging
 from transformers import AutoFeatureExtractor, AutoModel
 from queue import Queue
 from typing import List, Tuple
+import time
+import gc
 
 logger = logging.getLogger(__name__)
 
 class Embedder:
-    def __init__(self, model_name: str, device: torch.device, processor: AutoFeatureExtractor, embedding_root: str, batch_size: int = 16):
+    def __init__(self, model_name: str, device: torch.device, processor: AutoFeatureExtractor, embedding_root: str, batch_size: int = 1):
         self.model_name = model_name
         self.device = device
         self.processor = processor
@@ -21,6 +23,7 @@ class Embedder:
         self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device).eval()
 
     def embed_batch(self, batch: List[Tuple[int, str]]):
+        batch_start_time = time.time()
         try:
             song_ids, wav_paths = zip(*batch)
             waveforms = []
@@ -29,15 +32,11 @@ class Embedder:
             for song_id, wav_path in zip(song_ids, wav_paths):
                 try:
                     waveform, sample_rate = torchaudio.load(wav_path)
-                    logger.debug(f"Loaded waveform shape for {wav_path}: {waveform.shape}")
-                    # Convert to mono by averaging channels if necessary
                     if waveform.shape[0] > 1:
                         waveform = waveform.mean(dim=0, keepdim=True)
-                        logger.debug(f"Converted to mono waveform shape: {waveform.shape}")
-                    # Ensure waveform is 1D
                     waveform = waveform.squeeze().numpy()
                     if waveform.ndim == 0:
-                        waveform = waveform.unsqueeze(0)
+                        waveform = waveform.reshape(1)
                     waveforms.append(waveform)
                     valid_song_ids.append(song_id)
                     valid_wav_paths.append(wav_path)
@@ -48,35 +47,24 @@ class Embedder:
                 logger.warning("No valid WAV files to embed in this batch.")
                 return []
 
-            # Process waveforms with the processor
             inputs = self.processor(
                 waveforms,
                 sampling_rate=self.processor.sampling_rate,
                 padding=True,
                 return_tensors="pt"
             )
-            logger.debug(f"Processor output keys: {inputs.keys()}")
 
-            # Inspect shapes
-            for k, v in inputs.items():
-                logger.debug(f"Processor output '{k}' shape: {v.shape}")
-
-            # If any tensor is 4D, reshape it to 3D by removing the extra dimension
-            # Assuming the extra dimension is at index 2
+            # Remove the third dimension if exists (for compatibility)
             for k, v in inputs.items():
                 if v.dim() == 4:
-                    logger.debug(f"Squeezing input '{k}' with shape {v.shape}")
-                    inputs[k] = v.squeeze(2)  # Remove the third dimension
-                    logger.debug(f"Input '{k}' reshaped to {inputs[k].shape}")
+                    inputs[k] = v.squeeze(2)
 
-            # Move tensors to the device
+            # Move inputs to GPU
             inputs = {k: v.to(self.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
 
             with torch.inference_mode():
                 outputs = self.model(**inputs, output_hidden_states=True)
 
-            # Assuming the model returns hidden states and you want to extract embeddings
-            # Modify this part based on your specific embedding extraction logic
             all_layer_hidden_states = torch.stack(outputs.hidden_states).permute(1, 0, 2, 3)
             time_reduced_hidden_states = all_layer_hidden_states.mean(-2)
             embeddings = time_reduced_hidden_states.mean(dim=1).cpu().numpy()
@@ -93,6 +81,15 @@ class Embedder:
                     logger.info(f"Embedded and saved {wav_path} to {embedding_file}")
                 except Exception as e:
                     logger.error(f"Failed to save embedding for song ID {song_id}: {e}")
+
+            batch_time = time.time() - batch_start_time
+            logger.info(f"Batch embedding time: {batch_time:.2f} seconds for {len(batch)} items.")
+
+            # Clear memory
+            del inputs, outputs, embeddings
+            gc.collect()
+            torch.cuda.empty_cache()
+
             return embedding_files
         except Exception as e:
             logger.error(f"Failed to embed batch: {e}")

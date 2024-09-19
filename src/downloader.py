@@ -3,61 +3,51 @@
 import os
 import requests
 import logging
-from queue import Queue
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
-def download_file(session, song_id, url, save_dir):
-    """
-    Downloads a file from the given URL and saves it to the specified directory.
-    
-    Args:
-        session (requests.Session): The requests session object.
-        song_id (int): The unique identifier for the song.
-        url (str): The URL to download the file from.
-        save_dir (str): The directory to save the downloaded file.
-    
-    Returns:
-        tuple: (song_id, save_path) if successful, else None.
-    """
-    try:
-        if not url:
-            logger.error(f"No URL provided for song ID {song_id}")
-            return None
-        save_path = os.path.join(save_dir, f"{song_id}.m4a")
-        with session.get(url, stream=True, timeout=30) as response:
-            response.raise_for_status()
-            with open(save_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive chunks
-                        f.write(chunk)
-        logger.info(f"Downloaded {url} to {save_path}")
-        return (song_id, save_path)
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Failed to download {url}: {e}")
-        return None
+class Downloader:
+    def __init__(self, raw_dir: str, download_workers: int = 2):
+        self.raw_dir = raw_dir
+        os.makedirs(self.raw_dir, exist_ok=True)
+        self.download_workers = download_workers
 
-def downloader_worker(download_queue: Queue, convert_queue: Queue, download_dir: str, max_workers: int = 8):
-    """
-    Worker function to download files using a thread pool.
+    def download_file(self, url: str, song_id: int) -> Tuple[int, str]:
+        """
+        Downloads a single file from the given URL.
+        """
+        local_filename = os.path.join(self.raw_dir, f"{song_id}.m4a")
+        try:
+            with requests.get(url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                with open(local_filename, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            logger.info(f"Downloaded {url} to {local_filename}")
+            return (song_id, local_filename)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download {url} for song ID {song_id}: {e}")
+            return (song_id, None)
 
-    Args:
-        download_queue (Queue): Queue containing download tasks.
-        convert_queue (Queue): Queue to enqueue successfully downloaded files for conversion.
-        download_dir (str): Directory to save downloaded files.
-        max_workers (int): Number of threads in the thread pool.
-    """
-    with ThreadPoolExecutor(max_workers=max_workers) as executor, requests.Session() as session:
-        while True:
-            task = download_queue.get()
-            if task is None:
-                logger.info("Downloader received shutdown signal.")
-                download_queue.task_done()
-                break
-            song_id, url = task
-            future = executor.submit(download_file, session, song_id, url, download_dir)
-            result = future.result()
-            if result:
-                convert_queue.put(result)
-            download_queue.task_done()
+    def download_files(self, url_song_id_pairs: List[Tuple[str, int]]) -> List[Tuple[int, str]]:
+        """
+        Downloads multiple files concurrently.
+        """
+        results = []
+        with ThreadPoolExecutor(max_workers=self.download_workers) as executor:
+            future_to_song = {
+                executor.submit(self.download_file, url, song_id): song_id
+                for url, song_id in url_song_id_pairs
+            }
+            for future in as_completed(future_to_song):
+                song_id = future_to_song[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"Unhandled exception during download of song ID {song_id}: {e}")
+                    results.append((song_id, None))
+        return results
