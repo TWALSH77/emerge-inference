@@ -1,8 +1,8 @@
-torch
-torchaudio
-transformers
-soundfile
-joblib
-tqdm
-h5py
-pandas
+torch==2.0.1+cu117
+torchaudio==2.0.1+cu117
+transformers==4.34.0
+pandas==1.5.3
+h5py==3.8.0
+tqdm==4.64.1
+numpy==1.23.5
+soundfile==0.12.1

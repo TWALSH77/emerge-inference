@@ -1,192 +1,155 @@
+# main.py
+
 import sys
 import os
-import argparse
-from functools import partial
-import glob
-import h5py
-from tqdm import tqdm
-from transformers import AutoFeatureExtractor, AutoModel
-from src.data.dataset import GenericAudioDataset, audio_collate_fn_segments
-import torch
 import logging
-import time
+from queue import Queue
+from threading import Thread
+import argparse
+import pandas as pd
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from src.downloader import downloader_worker
+from src.converter import converter_worker
+from src.embedder import Embedder
+from src.storage import storage_worker
 
-def parse_arguments():
-    """
-    Parses command-line arguments.
+import torch
+from transformers import AutoFeatureExtractor
 
-    Returns:
-        argparse.Namespace: Parsed arguments.
-    """
-    parser = argparse.ArgumentParser(description="Generate Audio Embeddings")
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for DataLoader')
-    parser.add_argument('--num_workers', type=int, default=8, help='Number of workers for DataLoader')
-    parser.add_argument('--segment_length', type=int, default=10, help='Length of each audio segment in seconds')
-    parser.add_argument('--overlap', type=int, default=1, help='Overlap between segments in seconds')
-    parser.add_argument('--device', type=str, default=None, help='Device to use: cuda, mps, cpu')
-    parser.add_argument('--max_segments', type=int, default=None, help='Maximum number of segments to process (for testing)')
-    return parser.parse_args()
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
 def main():
-    # Parse command-line arguments
-    args = parse_arguments()
-    batch_size = args.batch_size
-    num_workers = args.num_workers
-    segment_length = args.segment_length
-    overlap = args.overlap
-    specified_device = args.device
-    max_segments = args.max_segments
+    setup_logging()
+    logger = logging.getLogger("Main")
 
-    logger.info(f"Batch size: {batch_size}")
-    logger.info(f"Number of workers: {num_workers}")
-    logger.info(f"Segment length: {segment_length} seconds")
-    logger.info(f"Overlap: {overlap} seconds")
-    if max_segments:
-        logger.info(f"Max segments: {max_segments}")
-    else:
-        logger.info("Max segments: None (processing all segments)")
+    parser = argparse.ArgumentParser(description="MERT Model Audio Embedding Pipeline")
+    parser.add_argument('--csv', type=str, required=True, help='Path to CSV file with audio metadata')
+    parser.add_argument('--download_workers', type=int, default=8, help='Number of downloader threads')
+    parser.add_argument('--convert_workers', type=int, default=4, help='Number of converter threads')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size for embedding')
+    parser.add_argument('--model_name', type=str, default="m-a-p/MERT-v1-95M", help='Model name for embedding')
+    args = parser.parse_args()
 
     # Create necessary directories
     current_dir = os.path.dirname(os.path.realpath(__file__))
-    save_dir = os.path.join(current_dir, 'data', 'raw')
-    csv_root = os.path.join(current_dir, 'data', 'csvs')
+    download_dir = os.path.join(current_dir, 'data', 'raw')
+    wav_dir = os.path.join(current_dir, 'data', 'wav')
     embedding_root = os.path.join(current_dir, 'data', 'embeddings')
-
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(csv_root, exist_ok=True)
+    os.makedirs(download_dir, exist_ok=True)
+    os.makedirs(wav_dir, exist_ok=True)
     os.makedirs(embedding_root, exist_ok=True)
 
-    logger.info(f"Save directory (audio files): {save_dir}")
-    logger.info(f"CSV root directory: {csv_root}")
-    logger.info(f"Embedding root directory: {embedding_root}")
-
-    # Set the device
-    if specified_device:
-        device = torch.device(specified_device)
-    else:
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    logger.info(f"Using device: {device}")
-
-    # Load model and processor
-    model_name = "m-a-p/MERT-v1-95M"
-    logger.info(f"Loading model: {model_name}")
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    model.eval()
-    model.to(device)
-    logger.info("Model loaded and moved to device.")
-
-    processor = AutoFeatureExtractor.from_pretrained(model_name, trust_remote_code=True)
-    resample_rate = processor.sampling_rate
-    logger.info(f"Processor sampling rate: {resample_rate}")
-
-    # Sanitize model_name for filenames
-    safe_model_name = model_name.replace('/', '_')
-
-    # Process CSV files
-    csv_files = glob.glob(os.path.join(csv_root, "*.csv"))
-    logger.info(f"Found CSV files: {csv_files}")
-
-    if not csv_files:
-        logger.error("No CSV files found in the CSV root directory.")
+    # Read CSV file
+    csv_file = args.csv
+    if not os.path.exists(csv_file):
+        logger.error(f"CSV file does not exist: {csv_file}")
         sys.exit(1)
 
-    for csv_file in csv_files:
-        csv_file_name = os.path.basename(csv_file)
-        songs_root_path = os.path.join(save_dir, os.path.splitext(csv_file_name)[0])
+    # Read the CSV to get download tasks
+    df = pd.read_csv(csv_file)
+    download_tasks = []
+    for _, row in df.iterrows():
+        song_id = row['id']
+        preview_url = row.get('previewUrl', None)
+        if pd.isna(preview_url):
+            logger.warning(f"Missing previewUrl for song ID {song_id}")
+            continue
+        download_tasks.append((song_id, preview_url))
 
-        logger.info(f"\nProcessing CSV file: {csv_file}")
+    if not download_tasks:
+        logger.error("No download tasks found.")
+        sys.exit(1)
 
-        # Initialize the dataset
-        ds = GenericAudioDataset(
-            csv_file=csv_file,
-            root_path=save_dir,
-            sample_rate=resample_rate,
-            segment_length=segment_length,
-            overlap=overlap,
-            max_segments=max_segments,  # Optional: Limit segments for testing
-        )
-        logger.info(f"Dataset length: {len(ds)} segments")
+    logger.info(f"Total download tasks: {len(download_tasks)}")
 
-        if len(ds) == 0:
-            logger.warning("Dataset is empty. Please check if the audio files exist at the specified paths.")
-            continue  # Skip to the next CSV file if dataset is empty
+    # Initialize queues
+    download_queue = Queue(maxsize=100)
+    convert_queue = Queue(maxsize=100)
+    embed_queue = Queue(maxsize=100)
+    storage_queue = Queue(maxsize=100)
 
-        # Initialize the DataLoader
-        my_collate_fn = partial(audio_collate_fn_segments, processor=processor)
-        data_loader = torch.utils.data.DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True if device.type == 'cuda' else False,
-            collate_fn=my_collate_fn,
-        )
-        logger.info("DataLoader initialized.")
+    # Start downloader threads
+    num_downloader_threads = args.download_workers
+    downloader_threads = []
+    for _ in range(num_downloader_threads):
+        t = Thread(target=downloader_worker, args=(download_queue, convert_queue, download_dir))
+        t.start()
+        downloader_threads.append(t)
 
-        # Create embedding directory for the current CSV file
-        embedding_dir = os.path.join(embedding_root, os.path.splitext(csv_file_name)[0])
-        os.makedirs(embedding_dir, exist_ok=True)
+    # Start converter threads
+    num_converter_threads = args.convert_workers
+    converter_threads = []
+    for _ in range(num_converter_threads):
+        t = Thread(target=converter_worker, args=(convert_queue, embed_queue, wav_dir))
+        t.start()
+        converter_threads.append(t)
 
-        # Start inference
-        logger.info("Starting inference...")
-        inference_start_time = time.time()
+    # Initialize Embedder
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+    logger.info(f"Using device: {device}")
 
-        with torch.inference_mode():
-            for idx, input_audio in tqdm(enumerate(data_loader), total=len(data_loader), desc="Inference"):
-                if not input_audio:
-                    logger.warning("Empty batch received. Skipping.")
-                    continue
+    model_name = args.model_name
+    processor = AutoFeatureExtractor.from_pretrained(model_name, trust_remote_code=True)
+    embedder = Embedder(model_name, device, processor, embedding_root, batch_size=args.batch_size)
 
-                ids = [int(x) for x in input_audio['id']]
-                inputs = {
-                    'input_values': input_audio['input_values'].to(device),
-                    'attention_mask': input_audio.get('attention_mask', None)
-                }
+    # Start storage thread
+    storage_thread = Thread(target=storage_worker, args=(storage_queue,))
+    storage_thread.start()
 
-                # Move attention_mask to device if it exists
-                if inputs['attention_mask'] is not None:
-                    inputs['attention_mask'] = inputs['attention_mask'].to(device)
+    # Start embedder thread
+    embedder_thread = Thread(target=embedder.embed_worker, args=(embed_queue, storage_queue))
+    embedder_thread.start()
 
-                # Debugging: log input shapes at debug level
-                logger.debug(f"Input values shape: {inputs['input_values'].shape}")
-                if inputs['attention_mask'] is not None:
-                    logger.debug(f"Attention mask shape: {inputs['attention_mask'].shape}")
+    # Enqueue download tasks
+    for task in download_tasks:
+        download_queue.put(task)
 
-                # Forward pass through the model
-                outputs = model(**inputs, output_hidden_states=True)
+    # Add sentinel values to downloader queue
+    for _ in range(num_downloader_threads):
+        download_queue.put(None)
 
-                # Process outputs
-                all_layer_hidden_states = torch.stack(outputs.hidden_states).permute(1, 0, 2, 3)
-                time_reduced_hidden_states = all_layer_hidden_states.mean(-2)
+    # Wait for all downloads to finish
+    for t in downloader_threads:
+        t.join()
+    logger.info("All downloads completed.")
 
-                # Aggregate embeddings per unique ID
-                unique_ids = torch.unique(torch.tensor(ids))
-                for unique_id in unique_ids:
-                    indices = torch.where(torch.tensor(ids) == unique_id)[0]
-                    time_reduced_hidden_states_ind = time_reduced_hidden_states[indices].mean(0, keepdim=True)
+    # Add sentinel values to converter queue
+    for _ in range(num_converter_threads):
+        convert_queue.put(None)
 
-                    # Save embeddings
-                    embedding_file = os.path.join(
-                        embedding_dir,
-                        f"audio_embeddings_{safe_model_name}_{unique_id.item()}.h5"
-                    )
-                    with h5py.File(embedding_file, 'w') as hf:
-                        hf.create_dataset(str(unique_id.item()), data=time_reduced_hidden_states_ind.cpu().numpy())
+    # Wait for all conversions to finish
+    for t in converter_threads:
+        t.join()
+    logger.info("All conversions completed.")
 
-        inference_end_time = time.time()
-        logger.info(f"Inference completed in {inference_end_time - inference_start_time:.2f} seconds.")
-        logger.info(f"Processing complete for CSV file: {csv_file_name}")
+    # Add sentinel to embed queue to signal no more data
+    embed_queue.put(None)
 
-    logger.info("All CSV files have been processed.")
+    # Wait for embedder to finish
+    embedder_thread.join()
+    logger.info("All embeddings completed.")
+
+    # Add sentinel to storage queue
+    storage_queue.put(None)
+
+    # Wait for storage to finish
+    storage_thread.join()
+    logger.info("All embeddings stored.")
+
+    logger.info("Processing complete.")
 
 if __name__ == "__main__":
     main()
