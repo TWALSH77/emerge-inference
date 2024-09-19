@@ -21,13 +21,14 @@ def setup_logging():
         level=logging.INFO,
         format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
         handlers=[
-            logging.StreamHandler(sys.stdout)
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("pipeline.log", mode='a')
         ]
     )
 
 def read_csv_file(csv_path):
     try:
-        # Attempt to read the CSV, skipping bad lines and logging them
+        # Read CSV, skip bad lines, and log warnings
         df = pd.read_csv(csv_path, on_bad_lines='warn')  # For pandas >= 1.3.0
         logging.info(f"Successfully read CSV file: {csv_path}")
         return df
@@ -48,6 +49,7 @@ def main():
     parser.add_argument('--convert_workers', type=int, default=4, help='Number of converter threads')
     parser.add_argument('--batch_size', type=int, default=16, help='Batch size for embedding')
     parser.add_argument('--model_name', type=str, default="m-a-p/MERT-v1-95M", help='Model name for embedding')
+    parser.add_argument('--max_missing_threshold', type=float, default=0.2, help='Maximum allowed fraction of missing preview URLs before proceeding')
     args = parser.parse_args()
 
     # Create necessary directories
@@ -66,20 +68,36 @@ def main():
         sys.exit(1)
 
     df = read_csv_file(csv_file)
+    initial_count = len(df)
     download_tasks = []
-    for _, row in df.iterrows():
-        song_id = row['id']
-        preview_url = row.get('previewUrl', None)
+    for index, row in df.iterrows():
+        song_id = row.get('id')
+        preview_url = row.get('previewUrl')
+
         if pd.isna(preview_url):
-            logger.warning(f"Missing previewUrl for song ID {song_id}")
+            logger.warning(f"Missing previewUrl for song ID {song_id} at row {index + 2}")  # +2 accounts for header and 0-indexing
             continue
+
+        # Basic validation of preview_url
+        if not isinstance(preview_url, str) or not preview_url.startswith(('http://', 'https://')):
+            logger.warning(f"Invalid previewUrl for song ID {song_id} at row {index + 2}: {preview_url}")
+            continue
+
         download_tasks.append((song_id, preview_url))
 
-    if not download_tasks:
-        logger.error("No download tasks found.")
-        sys.exit(1)
-
+    missing_preview_count = initial_count - len(download_tasks)
     logger.info(f"Total download tasks: {len(download_tasks)}")
+    logger.info(f"Total missing or invalid previewUrls: {missing_preview_count}")
+
+    # Optional: Alert if missing previews exceed a threshold
+    if missing_preview_count / initial_count > args.max_missing_threshold:
+        logger.error(f"High number of missing previewUrls: {missing_preview_count} out of {initial_count} ({missing_preview_count / initial_count * 100:.2f}%)")
+        # Instead of exiting, decide to proceed or handle accordingly
+        # For now, proceed with a warning
+
+    if not download_tasks:
+        logger.error("No valid download tasks found.")
+        sys.exit(1)
 
     # Initialize queues
     download_queue = Queue(maxsize=100)
@@ -129,7 +147,7 @@ def main():
     for task in download_tasks:
         download_queue.put(task)
 
-    # Add sentinel values to downloader queue
+    # Add sentinel values to downloader queue to signal no more tasks
     for _ in range(num_downloader_threads):
         download_queue.put(None)
 
@@ -138,7 +156,7 @@ def main():
         t.join()
     logger.info("All downloads completed.")
 
-    # Add sentinel values to converter queue
+    # Add sentinel values to converter queue to signal no more tasks
     for _ in range(num_converter_threads):
         convert_queue.put(None)
 
@@ -154,7 +172,7 @@ def main():
     embedder_thread.join()
     logger.info("All embeddings completed.")
 
-    # Add sentinel to storage queue
+    # Add sentinel to storage queue to signal no more data
     storage_queue.put(None)
 
     # Wait for storage to finish
