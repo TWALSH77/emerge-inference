@@ -1,175 +1,205 @@
 import sys
 import os
-import csv
+import logging
+import argparse
+import pandas as pd
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, IterableDataset
+from transformers import AutoFeatureExtractor, AutoModel
+import torchaudio
 import requests
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import io
+import csv
+from tqdm import tqdm
+from queue import Queue
+from threading import Thread
+from pydub import AudioSegment
 import tempfile
 
-# Add src folder to the path
-current_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(os.path.join(current_dir, 'src'))
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s [%(name)s] %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    return logging.getLogger("Main")
 
-from functools import partial
-import glob
-import h5py
-from tqdm import tqdm
-from transformers import AutoFeatureExtractor, AutoModel
-import torch
-from pydub import AudioSegment
-import librosa
+def download_and_convert(task, wav_dir, target_sr=24000):
+    song_id, preview_url = task
+    wav_path = os.path.join(wav_dir, f"{song_id}.wav")
 
-class CustomAudioDataset(torch.utils.data.Dataset):
-    def __init__(self, audio_path, sample_rate, segment_length):
-        self.audio_path = audio_path
-        self.sample_rate = sample_rate
-        self.segment_length = segment_length
-        self.audio, _ = librosa.load(self.audio_path, sr=self.sample_rate)
-        
-    def __len__(self):
-        return max(1, len(self.audio) // (self.sample_rate * self.segment_length))
+    if not os.path.exists(wav_path):
+        try:
+            response = requests.get(preview_url)
+            response.raise_for_status()
+            
+            with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as temp_m4a:
+                temp_m4a.write(response.content)
+                temp_m4a_path = temp_m4a.name
+
+            audio = AudioSegment.from_file(temp_m4a_path, format="m4a")
+            audio = audio.set_frame_rate(target_sr)
+            audio.export(wav_path, format="wav")
+
+            os.unlink(temp_m4a_path)
+
+        except Exception as e:
+            logging.error(f"Error processing {song_id}: {str(e)}")
+            return None
     
-    def __getitem__(self, idx):
-        start = idx * self.sample_rate * self.segment_length
-        end = start + self.sample_rate * self.segment_length
-        audio_segment = self.audio[start:end]
+    return song_id, wav_path
+
+def read_csv_robust(file_path):
+    with open(file_path, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        data = []
+        for row in reader:
+            if len(row) >= 2:
+                data.append(row[:len(headers)])
+    return pd.DataFrame(data, columns=headers)
+
+class PipelineDataset(IterableDataset):
+    def __init__(self, csv_dir, wav_dir, processor, num_workers):
+        self.csv_dir = csv_dir
+        self.wav_dir = wav_dir
+        self.processor = processor
+        self.num_workers = num_workers
+        self.download_queue = Queue(maxsize=1000)
+        self.process_queue = Queue(maxsize=1000)
+
+    def csv_reader(self):
+        csv_files = [f for f in os.listdir(self.csv_dir) if f.startswith("chunk_") and f.endswith(".csv")]
+        for chunk_file in csv_files:
+            chunk_path = os.path.join(self.csv_dir, chunk_file)
+            try:
+                chunk_df = read_csv_robust(chunk_path)
+                for _, row in chunk_df.iterrows():
+                    if pd.notna(row['previewUrl']):
+                        self.download_queue.put((row['id'], row['previewUrl']))
+            except Exception as e:
+                logging.error(f"Error reading {chunk_file}: {str(e)}")
         
-        if len(audio_segment) < self.sample_rate * self.segment_length:
-            audio_segment = librosa.util.fix_length(audio_segment, size=self.sample_rate * self.segment_length)
+        for _ in range(self.num_workers):
+            self.download_queue.put(None)
+
+    def downloader(self):
+        while True:
+            item = self.download_queue.get()
+            if item is None:
+                break
+            result = download_and_convert(item, self.wav_dir)
+            if result:
+                self.process_queue.put(result)
+        self.process_queue.put(None)
+
+    def processor_worker(self):
+        target_sr = self.processor.sampling_rate
+        resampler = torchaudio.transforms.Resample(orig_freq=44100, new_freq=target_sr)
         
-        return {'input_values': audio_segment, 'id': idx}
+        while True:
+            item = self.process_queue.get()
+            if item is None:
+                break
+            song_id, wav_path = item
+            waveform, sample_rate = torchaudio.load(wav_path)
+            
+            if sample_rate != target_sr:
+                waveform = resampler(waveform)
+            
+            # Ensure mono audio
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+            # Normalize the waveform
+            waveform = waveform - waveform.mean()
+            waveform = waveform / waveform.abs().max()
+            
+            inputs = self.processor(waveform.numpy(), sampling_rate=target_sr, return_tensors="pt")
+            yield song_id, inputs.input_values.squeeze(0)
 
-def custom_collate_fn(batch, processor):
-    input_values = [item['input_values'] for item in batch]
-    processed = processor(input_values, sampling_rate=processor.sampling_rate, return_tensors="pt", padding=True)
-    ids = [item['id'] for item in batch]
-    return {'input_values': processed.input_values, 'attention_mask': processed.attention_mask, 'id': ids}
+    def __iter__(self):
+        csv_thread = Thread(target=self.csv_reader)
+        csv_thread.start()
 
-def download_m4a(url):
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.content
-    else:
-        raise Exception(f"Failed to download file from {url}")
+        download_threads = []
+        for _ in range(self.num_workers):
+            t = Thread(target=self.downloader)
+            t.start()
+            download_threads.append(t)
 
-def convert_m4a_to_wav(m4a_data):
-    with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as temp_m4a:
-        temp_m4a.write(m4a_data)
-        temp_m4a_path = temp_m4a.name
+        yield from self.processor_worker()
 
-    audio = AudioSegment.from_file(temp_m4a_path, format="m4a")
-    
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_wav:
-        audio.export(temp_wav.name, format="wav")
-        temp_wav_path = temp_wav.name
+        csv_thread.join()
+        for t in download_threads:
+            t.join()
 
-    os.unlink(temp_m4a_path)
-    return temp_wav_path
+def collate_fn(batch):
+    ids, audio = zip(*batch)
+    return list(ids), torch.nn.utils.rnn.pad_sequence(audio, batch_first=True)
 
 def main():
-    # Create necessary directories
+    logger = setup_logging()
+    parser = argparse.ArgumentParser(description="Pipelined MERT Model Audio Embedding Pipeline")
+    parser.add_argument('--csv_dir', type=str, required=True, help='Path to directory containing CSV files')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for embedding')
+    parser.add_argument('--model_name', type=str, default="m-a-p/MERT-v1-95M", help='Model name for embedding')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for data loading')
+    args = parser.parse_args()
+
     current_dir = os.path.dirname(os.path.realpath(__file__))
-    save_dir = os.path.join(current_dir, 'data', 'raw')
-    csv_root = os.path.join(current_dir, 'data', 'csvs')
-    embedding_root = os.path.join(current_dir, 'data', 'embeddings')
+    data_dir = os.path.join(current_dir, 'data')
+    wav_dir = os.path.join(data_dir, 'raw')
+    csv_dir = os.path.join(data_dir, 'csvs')
+    embeddings_dir = os.path.join(data_dir, 'embeddings')
+    os.makedirs(wav_dir, exist_ok=True)
+    os.makedirs(embeddings_dir, exist_ok=True)
 
-    os.makedirs(save_dir, exist_ok=True)
-    os.makedirs(csv_root, exist_ok=True)
-    os.makedirs(embedding_root, exist_ok=True)
-
-    # Set the device
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
-    # Load model and processor
-    model_name = "m-a-p/MERT-v1-95M"
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    model = model.eval()
-    model.to(device)
+    processor = AutoFeatureExtractor.from_pretrained(args.model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(args.model_name, trust_remote_code=True).to(device)
 
-    processor = AutoFeatureExtractor.from_pretrained(model_name, trust_remote_code=True)
-    resample_rate = processor.sampling_rate
+    dataset = PipelineDataset(csv_dir, wav_dir, processor, args.num_workers)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn)
 
-    # Sanitize model_name for filenames
-    safe_model_name = model_name.replace('/', '_')
+    embeddings = {}
+    model.eval()
+    with torch.no_grad():
+        for batch_ids, batch_audio in tqdm(dataloader, desc="Generating embeddings"):
+            batch_audio = batch_audio.to(device)
+            outputs = model(batch_audio)
+            batch_embeddings = outputs.last_hidden_state.mean(dim=1)
+            for id, embedding in zip(batch_ids, batch_embeddings):
+                embeddings[id] = embedding.cpu().numpy()
 
-    # Print the current working directory for debugging
-    print(f"Current working directory: {current_dir}")
-    print(f"CSV root directory: {csv_root}")
-    print(f"Save directory (audio files): {save_dir}")
-    print(f"Embedding root directory: {embedding_root}")
+    logger.info("Embedding generation complete. Updating CSV files...")
 
-    # Process CSV files
-    csv_files = glob.glob(os.path.join(csv_root, "chunk_*.csv"))
-    print(f"Found CSV files")
-    for csv_file in csv_files:
-        csv_file_name = os.path.basename(csv_file)
-        print(f"\nProcessing CSV file: {csv_file}")
+    # Update CSV files with embeddings
+    csv_files = [f for f in os.listdir(csv_dir) if f.startswith("chunk_") and f.endswith(".csv")]
+    for chunk_file in tqdm(csv_files, desc="Updating CSV files with embeddings"):
+        chunk_path = os.path.join(csv_dir, chunk_file)
+        try:
+            chunk_df = read_csv_robust(chunk_path)
+            
+            chunk_df_with_embeddings = chunk_df.copy()
+            chunk_df_with_embeddings['embedding'] = chunk_df_with_embeddings['id'].map(embeddings)
+            
+            new_file_name = chunk_file.replace(".csv", "_with_embeddings.csv")
+            new_file_path = os.path.join(embeddings_dir, new_file_name)
+            chunk_df_with_embeddings.to_csv(new_file_path, index=False)
+        except Exception as e:
+            logger.error(f"Error processing {chunk_file}: {str(e)}")
 
-        # Read CSV and process each row
-        with open(csv_file, 'r') as file:
-            csv_reader = csv.DictReader(file)
-            for row in tqdm(csv_reader, desc="Processing tracks"):
-                preview_url = row['previewUrl']
-                track_id = row.get('id', 'unknown')  # Assuming there's an 'id' column, otherwise use 'unknown'
-
-                try:
-                    # Download and convert m4a to wav
-                    m4a_data = download_m4a(preview_url)
-                    temp_wav_path = convert_m4a_to_wav(m4a_data)
-
-                    # Create a temporary dataset with this single file
-                    temp_dataset = CustomAudioDataset(
-                        audio_path=temp_wav_path,
-                        sample_rate=resample_rate,
-                        segment_length=10
-                    )
-
-                    my_collate_fn = partial(custom_collate_fn, processor=processor)
-                    data_loader = torch.utils.data.DataLoader(
-                        temp_dataset,
-                        batch_size=1,
-                        shuffle=False,
-                        num_workers=0,
-                        pin_memory=False,
-                        collate_fn=my_collate_fn,
-                    )
-
-                    with torch.inference_mode():
-                        for input_audio in data_loader:
-                            inputs = {
-                                'input_values': input_audio['input_values'].to(device),
-                                'attention_mask': input_audio.get('attention_mask', None)
-                            }
-                            if inputs['attention_mask'] is not None:
-                                inputs['attention_mask'] = inputs['attention_mask'].to(device)
-
-                            outputs = model(**inputs, output_hidden_states=True)
-
-                            # Process outputs
-                            all_layer_hidden_states = torch.stack(outputs.hidden_states).permute(1, 0, 2, 3)
-                            time_reduced_hidden_states = all_layer_hidden_states.mean(-2)
-
-                            # Save embeddings
-                            embedding_dir = os.path.join(embedding_root, os.path.splitext(csv_file_name)[0])
-                            os.makedirs(embedding_dir, exist_ok=True)
-                            embedding_file = os.path.join(embedding_dir, f"audio_embeddings_{safe_model_name}_{track_id}.h5")
-                            with h5py.File(embedding_file, 'w') as hf:
-                                hf.create_dataset(str(track_id), data=time_reduced_hidden_states.cpu().numpy())
-
-                    # Clean up temporary file
-                    os.unlink(temp_wav_path)
-
-                except Exception as e:
-                    print(f"Error processing track ID {track_id}: {str(e)}")
-
-        print(f"Completed processing CSV file: {csv_file}")
-
-    print("All processing complete.")
+    logger.info("Processing complete. Created new CSV files with embeddings in the 'data/embeddings' directory.")
 
 if __name__ == "__main__":
     main()
